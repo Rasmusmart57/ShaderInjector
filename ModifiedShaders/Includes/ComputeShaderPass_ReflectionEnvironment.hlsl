@@ -160,6 +160,70 @@
 //NOTE 2: personally I would not use this, this is just a last-ditch cheap effort to help somewhat mitigate the noise, in the future this will be replaced by a proper filter pass but for now can somewhat help.
 //#define SSGI_BASIC_QUAD_DENOISE
 
+//Edge-aware spatial denoise of the SSGI bounce light, done inside this pass so no extra render pass is needed.
+//Each 8x8 tile of pixels shares its SSGI results through groupshared memory, and every pixel averages the
+//neighbors within SSGI_TILE_DENOISE_RADIUS that lie on the same surface (similar depth and normal). Detail at
+//edges and contact points is kept while the per-pixel noise averages out, and the game's TAA/upscaler only has
+//to clean up what is left. Filters the bounce light; ambient occlusion only with SSGI_TILE_DENOISE_AO.
+//NOTE: the kernel cannot reach across 8x8 tile borders, so pixels at a tile edge get slightly less denoising.
+//NOTE 2: averaging trades fine grain for coarse blobs, and blobs are more visible than grain. It is off by default
+//for that reason; SSGI_TILE_DENOISE on its own only shares the tile so the firefly clamp below has neighbours to
+//compare against.
+// #define SSGI_TILE_DENOISE
+
+//(SSGI_TILE_DENOISE ONLY) average the neighbours as described above. Off keeps the noise fine grained and only
+//clamps outliers, which is usually what you want at low render resolutions.
+// #define SSGI_TILE_DENOISE_BLUR
+
+//(SSGI_TILE_DENOISE ONLY) neighborhood radius in pixels (1 = 3x3, 2 = 5x5, 3 = 7x7), clipped to the 8x8 tile
+//[CONFIG TYPE]: int
+//[CONFIG DEFAULT]: 2
+//[CONFIG RANGE]: [1, 3]
+#define SSGI_TILE_DENOISE_RADIUS 3
+
+//(SSGI_TILE_DENOISE ONLY) how far a neighbor's depth may differ, relative to this pixel's depth, before it stops counting
+//lower = sharper at depth edges but less denoising
+//[CONFIG TYPE]: float
+//[CONFIG DEFAULT]: 0.05
+//[CONFIG RANGE]: [0.005, 0.5]
+#define SSGI_TILE_DENOISE_DEPTH_SIGMA 0.05
+
+//(SSGI_TILE_DENOISE ONLY) how strictly a neighbor must face the same way to count
+//higher = sharper at creases but less denoising
+//[CONFIG TYPE]: float
+//[CONFIG DEFAULT]: 8.0
+//[CONFIG RANGE]: [1, 64]
+#define SSGI_TILE_DENOISE_NORMAL_POWER 8.0
+
+//(SSGI_TILE_DENOISE ONLY) also denoise the SSGI ambient occlusion, which is far less noisy than the bounce light
+// #define SSGI_TILE_DENOISE_AO
+
+//(SSGI_TILE_DENOISE ONLY) removes bright speckles relative to their surroundings: every pixel's bounce light is capped
+//at SSGI_TILE_DENOISE_FIREFLY_RATIO times the typical bounce level of its 8x8 tile before it is averaged. A lone ray that
+//happened to hit a small bright source (fire, a glowing weapon) far away in a dark area is pulled down to the level
+//around it, while bounce that many pixels agree on - a lit wall, the ground right next to the flame - stays untouched.
+//The "typical level" is a Karis-weighted mean, which a few bright outliers cannot drag up much.
+// #define SSGI_TILE_DENOISE_FIREFLY_REJECT
+
+//(SSGI_TILE_DENOISE_FIREFLY_REJECT ONLY) how many times brighter than its tile's typical bounce a pixel may be
+//lower = fewer speckles but small genuine bounce highlights get dimmer; higher = the opposite
+//[CONFIG TYPE]: float
+//[CONFIG DEFAULT]: 3.0
+//[CONFIG RANGE]: [1, 32]
+#define SSGI_TILE_DENOISE_FIREFLY_RATIO 2.5
+
+//caps how bright a single SSGI bounce sample can be. With one ray per pixel, a small and very bright source like fire,
+//a glowing weapon or a lamp gets hit by some pixels and missed by their neighbors, which shows up as bright speckles
+//(fireflies) around it. The cap is in the game's pre-exposed scale, so it means the same in dark and bright scenes.
+// #define SSGI_FIREFLY_CLAMP
+
+//(SSGI_FIREFLY_CLAMP ONLY) the cap, as pre-exposed luminance. Lower = fewer speckles but less bounce from emissive and
+//very bright surfaces. Higher = more of that bounce but more speckles.
+//[CONFIG TYPE]: float
+//[CONFIG DEFAULT]: 4.0
+//[CONFIG RANGE]: [0.25, 64]
+#define SSGI_FIREFLY_CLAMP_LUMINANCE 4.0
+
 //||||||||||||||||||||||||||||||| CONFIGURATION - GLOBAL ILLUMINATION (REFLECTION / RADIANCE) |||||||||||||||||||||||||||||||
 //||||||||||||||||||||||||||||||| CONFIGURATION - GLOBAL ILLUMINATION (REFLECTION / RADIANCE) |||||||||||||||||||||||||||||||
 //||||||||||||||||||||||||||||||| CONFIGURATION - GLOBAL ILLUMINATION (REFLECTION / RADIANCE) |||||||||||||||||||||||||||||||
@@ -1764,6 +1828,12 @@ float4 ComputeGTVBGI(
 
                             float Visibility = (float)countbits(NewlyVisibleBits) * inv32;
                             float3 SampledRadiance = OutTextureColor[SampleBufferPixel].rgb;
+
+                            #if defined(SSGI_FIREFLY_CLAMP)
+                                //OutTextureColor is pre-exposed, so this cap scales with the scene's exposure - see SSGI_FIREFLY_CLAMP
+                                float sampledLuminance = LuminanceRec709(SampledRadiance);
+                                SampledRadiance *= min(1.0f, SSGI_FIREFLY_CLAMP_LUMINANCE / max(sampledLuminance, 1.0e-6f));
+                            #endif
                             SliceGI += SampledRadiance * Visibility;
                         }
                     }
@@ -1862,6 +1932,134 @@ float Vignette(float2 uv, float radius, float smoothness)
 	return smoothstep(-smoothness, smoothness, diff);
 }
 
+//||||||||||||||||||||||||||||||| SSGI TILE DENOISE |||||||||||||||||||||||||||||||
+//||||||||||||||||||||||||||||||| SSGI TILE DENOISE |||||||||||||||||||||||||||||||
+//||||||||||||||||||||||||||||||| SSGI TILE DENOISE |||||||||||||||||||||||||||||||
+
+#if (defined(SSGI_AMBIENT_OCCLUSION) || defined(SSGI_BOUNCE_LIGHT)) && defined(SSGI_TILE_DENOISE)
+
+//one entry per thread of the 8x8 group
+groupshared float4 gsSsgiTileSsgi[64];      //the SSGI result: rgb bounce light, a occlusion
+groupshared float4 gsSsgiTileGeometry[64];  //xyz world normal, w linear depth (0 = no SSGI here, never used as a neighbor)
+
+//NOTE: contains a group barrier, so every thread of the group has to reach it - only call it from uniform control flow
+float4 ApplySSGITileDenoise(uint2 groupThreadId, float4 ssgi, bool validSample, float3 worldNormal, float deviceDepth)
+{
+    uint localIndex = groupThreadId.y * 8u + groupThreadId.x;
+    float linearDepth = validSample ? ConvertFromDeviceZ(deviceDepth) : 0.0f;
+
+    gsSsgiTileSsgi[localIndex] = ssgi;
+    gsSsgiTileGeometry[localIndex] = float4(worldNormal, linearDepth);
+
+    GroupMemoryBarrierWithGroupSync();
+
+    if (!validSample)
+        return ssgi;
+
+    #if defined(SSGI_TILE_DENOISE_FIREFLY_REJECT)
+        //Typical bounce brightness around this pixel, as a Karis-weighted mean over the same neighborhood the filter
+        //below gathers (ssgi.rgb is absolute, hence View_PreExposure; 1 / (1 + luminance) keeps a few bright hits from
+        //dragging the mean up). This used to be one value for the entire 8x8 tile, which made the cap jump at tile
+        //borders and showed up as squares on smooth surfaces near a bright lamp. Per pixel it varies smoothly.
+        float referenceSum = 0.0f;
+        float referenceWeight = 0.0f;
+
+        [unroll]
+        for (int referenceOffsetY = -SSGI_TILE_DENOISE_RADIUS; referenceOffsetY <= SSGI_TILE_DENOISE_RADIUS; ++referenceOffsetY)
+        {
+            [unroll]
+            for (int referenceOffsetX = -SSGI_TILE_DENOISE_RADIUS; referenceOffsetX <= SSGI_TILE_DENOISE_RADIUS; ++referenceOffsetX)
+            {
+                int2 referenceNeighbor = int2(groupThreadId) + int2(referenceOffsetX, referenceOffsetY);
+
+                if (any(referenceNeighbor < 0) || any(referenceNeighbor > 7))
+                    continue;
+
+                uint referenceIndex = (uint)referenceNeighbor.y * 8u + (uint)referenceNeighbor.x;
+
+                if (gsSsgiTileGeometry[referenceIndex].w <= 0.0f)
+                    continue;
+
+                float referenceLuminance = LuminanceRec709(gsSsgiTileSsgi[referenceIndex].rgb) * View_PreExposure;
+                float referenceLuminanceWeight = rcp(1.0f + referenceLuminance);
+                referenceSum += referenceLuminance * referenceLuminanceWeight;
+                referenceWeight += referenceLuminanceWeight;
+            }
+        }
+
+        //this pixel counts itself, so referenceWeight is never zero
+        float fireflyLuminanceCap = (referenceSum / max(referenceWeight, 1.0e-6f)) * SSGI_TILE_DENOISE_FIREFLY_RATIO;
+    #endif
+
+    #if defined(SSGI_TILE_DENOISE_FIREFLY_REJECT)
+        //Pull this pixel down if it sticks out from its neighbours. Every pixel does the same, so a lone ray that
+        //hit something very bright loses its spike while the fine grain around it is left alone.
+        float ownLuminance = LuminanceRec709(ssgi.rgb) * View_PreExposure;
+        ssgi.rgb *= min(1.0f, fireflyLuminanceCap / max(ownLuminance, 1.0e-6f));
+    #endif
+
+#if defined(SSGI_TILE_DENOISE_BLUR)
+
+    float4 sum = 0.0f;
+    float weightSum = 0.0f;
+
+    [unroll]
+    for (int offsetY = -SSGI_TILE_DENOISE_RADIUS; offsetY <= SSGI_TILE_DENOISE_RADIUS; ++offsetY)
+    {
+        [unroll]
+        for (int offsetX = -SSGI_TILE_DENOISE_RADIUS; offsetX <= SSGI_TILE_DENOISE_RADIUS; ++offsetX)
+        {
+            int2 neighbor = int2(groupThreadId) + int2(offsetX, offsetY);
+
+            //the group only knows its own 8x8 pixels
+            if (any(neighbor < 0) || any(neighbor > 7))
+                continue;
+
+            uint neighborIndex = (uint)neighbor.y * 8u + (uint)neighbor.x;
+            float4 neighborGeometry = gsSsgiTileGeometry[neighborIndex];
+
+            if (neighborGeometry.w <= 0.0f)
+                continue;
+
+            //gaussian falloff with pixel distance, then edge stops on depth and normal so light never bleeds across surfaces
+            float spatialWeight = exp2(-(float)(offsetX * offsetX + offsetY * offsetY) / (float)(SSGI_TILE_DENOISE_RADIUS * SSGI_TILE_DENOISE_RADIUS));
+            float depthWeight = saturate(1.0f - abs(neighborGeometry.w - linearDepth) / (SSGI_TILE_DENOISE_DEPTH_SIGMA * linearDepth));
+            float normalWeight = pow(saturate(dot(neighborGeometry.xyz, worldNormal)), SSGI_TILE_DENOISE_NORMAL_POWER);
+            float weight = spatialWeight * depthWeight * normalWeight;
+
+            float4 neighborSsgi = gsSsgiTileSsgi[neighborIndex];
+
+            #if defined(SSGI_TILE_DENOISE_FIREFLY_REJECT)
+                //pull speckles down to the tile's typical level (occlusion in .a is left alone)
+                float neighborLuminance = LuminanceRec709(neighborSsgi.rgb) * View_PreExposure;
+                neighborSsgi.rgb *= min(1.0f, fireflyLuminanceCap / max(neighborLuminance, 1.0e-6f));
+            #endif
+
+            sum += neighborSsgi * weight;
+            weightSum += weight;
+        }
+    }
+
+    //the center pixel is always its own neighbor with a weight of ~1, so this never divides by ~0
+    float4 filtered = sum / max(weightSum, 1.0e-4f);
+
+    #if !defined(SSGI_TILE_DENOISE_AO)
+        filtered.a = ssgi.a;
+    #endif
+
+    #if !defined(SSGI_BOUNCE_LIGHT)
+        filtered.rgb = ssgi.rgb;
+    #endif
+
+    return filtered;
+
+#else
+    return ssgi;
+#endif
+}
+
+#endif
+
 //||||||||||||||||||||||||||||||| MAIN |||||||||||||||||||||||||||||||
 //||||||||||||||||||||||||||||||| MAIN |||||||||||||||||||||||||||||||
 //||||||||||||||||||||||||||||||| MAIN |||||||||||||||||||||||||||||||
@@ -1950,6 +2148,11 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
             }
         #endif
 
+#if defined(SSGI_TILE_DENOISE)
+            //every thread of the group reaches this (the early returns are further down), which the group barrier inside needs.
+            //dispatchThreadId & 7 is the thread's position inside its 8x8 group.
+            ssgi = ApplySSGITileDenoise(dispatchThreadId.xy & 7u, ssgi, shadePixel, gbufferData.WorldNormal, gbufferData.DeviceDepth);
+        #endif
         #if defined(SSGI_BOUNCE_LIGHT) && defined(SSGI_BASIC_QUAD_DENOISE)
             //Average the current lane and the other three lanes in its 2x2 pixel quad.
             float3 ssgiAcrossX = QuadReadAcrossX(ssgi.rgb);
