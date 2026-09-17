@@ -302,6 +302,41 @@
 //[CONFIG RANGE]: [0.1, 4]
 #define HDR_OUTPUT_SCALE 1.0
 
+//(HDR) lets highlights go past the game's own HDR ceiling of ~1000 nits, up to HDR_PEAK_NITS.
+//The game bakes its tone mapping into BT709PQToBT2020PQLUT, which tops out at ~1000 nits whatever the display can do.
+//This keeps the LUT's image as the base and only adds the extra highlight range an ACES output transform at
+//HDR_PEAK_NITS has over the same transform at 1000 nits - the same method RenoDX's "ACES" tone mapper uses for
+//this game. Shadows, midtones, the color grade and the UI are unchanged.
+//Keep the in-game Brightness at 0 and HDR Brightness at 10: below HDR Brightness 10 the game remaps to a lower
+//peak on purpose and this is skipped. Disable to get the game's own ~1000 nit HDR image back.
+// #define HDR_EXTEND_PEAK
+
+//(HDR_EXTEND_PEAK ONLY) the brightest a highlight can get, in nits. Set it to your display's peak brightness.
+//1000 is the game's own ceiling and changes nothing.
+//[CONFIG TYPE]: float
+//[CONFIG DEFAULT]: 1000.0
+//[CONFIG RANGE]: [400, 10000]
+#define HDR_PEAK_NITS 1000.0
+
+//(HDR_EXTEND_PEAK ONLY) how bright paper white (a white wall, not a light) is, in nits. The game uses 250.
+//Raising it brightens the whole image by the same ratio while highlights still top out at HDR_PEAK_NITS - the same
+//thing RenoDX's "Game Brightness" does. The UI has its own setting, HDR_UI_NITS.
+//[CONFIG TYPE]: float
+//[CONFIG DEFAULT]: 250.0
+//[CONFIG RANGE]: [80, 500]
+#define HDR_PAPER_WHITE_NITS 250.0
+
+//(HDR_EXTEND_PEAK ONLY) how much the highlights lose colour as they climb past what the game itself could output.
+//Real light goes white as it gets intense, and an ACES-style transform desaturates its top end for that reason; the
+//luminance-preserving scaling used here would otherwise carry full colour all the way to HDR_PEAK_NITS and make fire
+//and sunlight read as coloured rather than bright. It is applied in proportion to how much of a pixel's brightness
+//this extension actually added, so at the game's own levels nothing changes at all, and luminance is never altered.
+//0 disables it.
+//[CONFIG TYPE]: float
+//[CONFIG DEFAULT]: 0.35
+//[CONFIG RANGE]: [0, 1]
+#define HDR_HIGHLIGHT_DECHROMA 0.35
+
 //internal helpers derived from the variant selectors above, never set these by hand
 #if defined(POSTPROCESS_FINAL_HDR_3LAYER) || defined(POSTPROCESS_FINAL_HDR_BACKDROP) || defined(POSTPROCESS_FINAL_HDR_3LAYER_BACKDROP) || defined(POSTPROCESS_FINAL_HDR) || defined(POSTPROCESS_FINAL_HDR_REMAP) || defined(POSTPROCESS_FINAL_HDR_3LAYER_REMAP) || defined(POSTPROCESS_FINAL_HDR_BACKDROP_REMAP) || defined(POSTPROCESS_FINAL_HDR_3LAYER_BACKDROP_REMAP)
 	//[NO CONFIG]
@@ -1379,6 +1414,95 @@ float3 ApplyDeviceCorrectorRemap(float3 sceneNits, float3 sceneNormalized, float
 
 #endif //POSTPROCESS_FINAL_HDR_DEVICE_REMAP
 
+
+#if defined(HDR_EXTEND_PEAK)
+
+#include "LibraryACESOutputTransform.hlsl"
+
+//The game's HDR grade (BT709PQToBT2020PQLUT) has its tone mapping baked in, and that tone mapping rolls off to a
+//~1000 nit peak. The LUT's result stays the base here; what gets added is only the highlight range a brighter
+//display can show. This mirrors RenoDX's "ACES" tone mapper for this game (src/games/ff7rebirth/common.hlsl,
+//extractColorGradeAndApplyTonemap + UpgradeToneMapByLuminance):
+//  reference = ACES output transform at the game's own 1000 nit peak, 250 nit paper white
+//  extended  = the same transform at HDR_PEAK_NITS
+//  both are pinned to the LUT's own grade of scene mid gray, so the two only part ways in the highlights
+//  graded luminance += (extended - reference), applied as a scale so the LUT's color is kept
+//With HDR_PEAK_NITS at 1000 the two transforms are identical and the game's image passes through unchanged.
+static const float HDR_GAME_PAPER_WHITE_NITS = 250.0f;
+static const float HDR_GAME_PEAK_NITS = 1000.0f;
+
+float LuminanceBT2020(float3 linearColor)
+{
+    return dot(linearColor, float3(0.2627002120f, 0.6779980715f, 0.0593017165f));
+}
+
+//where the game's own grade puts scene mid gray (0.18), in paper white units
+float SampleGameGradeMidGray()
+{
+    float3 midGrayNits = PQToLinearNormalized(SampleGameGradeBT2020PQ(0.18f.xxx)) * PQ_MAX_NITS;
+    return LuminanceBT2020(midGrayNits / HDR_GAME_PAPER_WHITE_NITS);
+}
+
+//ungradedSceneColor: the linear scene that went into the LUT. gradedSceneNits: the LUT's result, BT.2020 in nits.
+float3 ApplyHDRPeakExtension(float3 ungradedSceneColor, float3 gradedSceneNits)
+{
+    //Shadows and midtones: there both transforms provably return the same value (see AcesOT_SceneBelowMidPoint and
+    //AcesOT_ToneScaleMidPoint), which makes everything below the identity. Most of the frame leaves here, so the
+    //extension only costs anything on the highlights it actually changes.
+    //With HDR_PAPER_WHITE_NITS above 250 the whole image is lifted by that ratio, like RenoDX's "Game Brightness":
+    //the result is worked out in paper white units (1.0 = paper white) and only turned into nits at the very end.
+    //At a paper white other than 250 the two transforms' toes differ slightly (their minimum luminance scales
+    //with it), so the early-outs below are then exact only down to ~0.01 nit rather than all the way to black.
+    const float paperWhiteScale = HDR_PAPER_WHITE_NITS / HDR_GAME_PAPER_WHITE_NITS;
+
+    float ungradedMax = max(ungradedSceneColor.r, max(ungradedSceneColor.g, ungradedSceneColor.b));
+    if (all(ungradedSceneColor >= 0.0f) && ungradedMax < AcesOT_SceneBelowMidPoint)
+        return gradedSceneNits * paperWhiteScale;
+
+    //the gamut compression and RRT are the same for both transforms, only the ODT differs
+    float3 rgbPre = AcesOT_RGCAndRRT(ungradedSceneColor);
+    if (max(rgbPre.r, max(rgbPre.g, rgbPre.b)) < AcesOT_ToneScaleMidPoint)
+        return gradedSceneNits * paperWhiteScale;
+
+    float midGray = SampleGameGradeMidGray();
+
+    //paper white units, BT.709 like the scene they come from. The reference is the game's own curve (1000 nit peak,
+    //250 nit paper white); the extended one uses the requested peak and paper white, exactly as RenoDX does.
+    float3 referenceBT709 = AcesOT_ODTFromRRT(rgbPre, midGray, HDR_GAME_PEAK_NITS, HDR_GAME_PAPER_WHITE_NITS);
+    float3 extendedBT709 = AcesOT_ODTFromRRT(rgbPre, midGray, HDR_PEAK_NITS, HDR_PAPER_WHITE_NITS);
+
+    float referenceY = LuminanceBT2020(max(Rec709ToRec2020(referenceBT709), 0.0f.xxx));
+    float extendedY = LuminanceBT2020(max(Rec709ToRec2020(extendedBT709), 0.0f.xxx));
+
+    float3 graded = max(gradedSceneNits / HDR_GAME_PAPER_WHITE_NITS, 0.0f.xxx);
+    float gradedY = LuminanceBT2020(graded);
+
+    float ratio;
+    if (extendedY < referenceY)
+        ratio = extendedY / referenceY; //HDR_PEAK_NITS below 1000: scale down instead
+    else
+        ratio = gradedY > 0.0f ? (gradedY + (extendedY - referenceY)) / gradedY : 0.0f;
+
+    //RenoDX clamps to the requested peak per BT.709 channel. The clamp here never goes below what the game itself
+    //output, so a peak set at or under the LUT's own ~1011 nit maximum can't clip the stock image.
+    float3 extended709 = Rec2020ToRec709(graded * ratio);
+    float3 graded709 = Rec2020ToRec709(graded);
+    extended709 = min(extended709, max((HDR_PEAK_NITS / HDR_PAPER_WHITE_NITS).xxx, graded709));
+
+    float3 extendedBT2020 = Rec709ToRec2020(extended709);
+
+    //Only the luminance this extension added counts, so the game's own range keeps its colour untouched:
+    //invented == 0 below the game's ceiling, and rises toward 1 the further past it a highlight is pushed.
+    //Blending toward the pixel's own luminance leaves that luminance exactly where it was.
+    //At HDR_HIGHLIGHT_DECHROMA 0 the compiler folds all of this away.
+    float finalY = LuminanceBT2020(max(extendedBT2020, 0.0f.xxx));
+    float invented = finalY > 0.0f ? saturate(1.0f - gradedY / finalY) : 0.0f;
+    extendedBT2020 = lerp(extendedBT2020, finalY.xxx, saturate(HDR_HIGHLIGHT_DECHROMA) * invented);
+
+    return extendedBT2020 * HDR_PAPER_WHITE_NITS;
+}
+
+#endif //HDR_EXTEND_PEAK
 float3 ComposeHDROutput(float3 sceneColor, float2 compositeUV, float2 pixelPosition, float4 vignetteRayContext
 #if defined(POSTPROCESS_FINAL_HDR_FRAMEGEN)
     //the hudless scene and how much of it survives the UI, both needed to rebuild the UI layer downstream
@@ -1399,6 +1523,23 @@ float3 ComposeHDROutput(float3 sceneColor, float2 compositeUV, float2 pixelPosit
         sceneNormalized = sceneNits * (1.0f / PQ_MAX_NITS);
     #endif
 
+
+    #if defined(HDR_EXTEND_PEAK)
+        //lift the highlights past the LUT's ~1000 nit ceiling - see ApplyHDRPeakExtension above. This runs after the
+        //calibration because its brightness gamma clips at 1000 nits and would cut the extension back off. Everything
+        //downstream (backdrop, UI composite, readability dim, frame generation targets) sees the extended scene.
+        bool extendPeak = true;
+        #if defined(POSTPROCESS_FINAL_HDR_DEVICE_REMAP)
+            //HDR Brightness below maximum means the player asked the game for a dimmer ceiling, so leave it alone
+            extendPeak = saturate(DeviceCorrectorContext.y) >= 1.0f;
+        #endif
+
+        if (extendPeak)
+        {
+            sceneNits = ApplyHDRPeakExtension(sceneColor, sceneNits);
+            sceneNormalized = sceneNits * (1.0f / PQ_MAX_NITS);
+        }
+    #endif
     #if defined(POSTPROCESS_FINAL_HDR_COMPOSITION)
         float compositionBlend = ComputeHDRCompositionBlend(vignetteRayContext);
         float3 compositionBackdrop = SampleSDRCompositionBackdrop(sceneNits);
